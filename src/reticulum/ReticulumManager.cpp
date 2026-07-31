@@ -416,18 +416,24 @@ void ReticulumManager::loop() {
 // node, so path tables are intentionally not persisted across boots.
 void ReticulumManager::persistData() {
     unsigned long start = millis();
+    unsigned long now = millis();
     unsigned long identityPersistMs = 0;
     unsigned long sdMirrorMs = 0;
     size_t sdMirrorBytes = 0;
     bool sdMirrorAttempted = false;
     bool sdMirrorOk = false;
-    const char* cycleName = "identity";
+    const char* cycleName = "identity-skip";
     switch (_persistCycle) {
         case 0:
         {
-            unsigned long phaseMs = millis();
-            RNS::Identity::persist_data();
-            identityPersistMs = millis() - phaseMs;
+            if (_lastIdentityPersist == 0 ||
+                now - _lastIdentityPersist >= IDENTITY_PERSIST_MIN_INTERVAL_MS) {
+                cycleName = "identity";
+                unsigned long phaseMs = millis();
+                RNS::Identity::persist_data();
+                identityPersistMs = millis() - phaseMs;
+                _lastIdentityPersist = now;
+            }
             break;
         }
         case 1:

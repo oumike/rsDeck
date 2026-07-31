@@ -169,14 +169,10 @@ void AnnounceManager::received_announce(
             if (nc == _nameCache.end() || nc->second != name) {
                 _nameCache[destHex] = name;
                 _nameCacheDirty = true;
-                saveNameCache();
-                _nameCacheDirty = false;
             }
         }
         if (!idHex.empty()) {
-            persistKnownDestinationsAfterAnnounce(
-                identityChanged ? "identity update" : "repeat announce",
-                identityChanged);
+            _knownDestinationsDirty = true;
         }
         return;
     }
@@ -201,8 +197,6 @@ void AnnounceManager::received_announce(
                     }
                 }
             }
-            saveNameCache();
-            _nameCacheDirty = false;
         }
     }
 
@@ -254,7 +248,7 @@ void AnnounceManager::received_announce(
     _hashIndex[key] = (int)_nodes.size();
     _nodes.push_back(node);
     if (!idHex.empty()) {
-        persistKnownDestinationsAfterAnnounce("new peer", true);
+        _knownDestinationsDirty = true;
     }
 }
 
@@ -270,13 +264,19 @@ void AnnounceManager::loop() {
         _nameCacheDirty = false;
         saveNameCache();
     }
+
+    if (_knownDestinationsDirty) {
+        if (persistKnownDestinationsAfterAnnounce("announce batch", false)) {
+            _knownDestinationsDirty = false;
+        }
+    }
 }
 
-void AnnounceManager::persistKnownDestinationsAfterAnnounce(const char* reason, bool force) {
+bool AnnounceManager::persistKnownDestinationsAfterAnnounce(const char* reason, bool force) {
     unsigned long now = millis();
     if (!force && _lastKnownDestinationsPersist != 0 &&
         now - _lastKnownDestinationsPersist < KNOWN_DESTINATION_PERSIST_MIN_INTERVAL_MS) {
-        return;
+        return false;
     }
 
     _lastKnownDestinationsPersist = now;
@@ -285,6 +285,7 @@ void AnnounceManager::persistKnownDestinationsAfterAnnounce(const char* reason, 
     unsigned long elapsed = millis() - startMs;
     Serial.printf("[ANNOUNCE] Known destinations persisted after %s (force=%s in %lums)\n",
                   reason ? reason : "announce", force ? "yes" : "no", elapsed);
+    return true;
 }
 
 int AnnounceManager::nodesOnlineSince(unsigned long maxAgeMs) const {

@@ -1,6 +1,7 @@
 #include "LvSettingsScreen.h"
 #include "ui/Theme.h"
 #include "ui/LvTheme.h"
+#include "platform/CoreSync.h"
 #include "ui/LvInput.h"
 #include "config/Config.h"
 #include "config/UserConfig.h"
@@ -474,23 +475,28 @@ void LvSettingsScreen::buildItems() {
                 return;
             }
             if (!_sd->exists(SD_PATH_IMPORT_IDENTITY) && !_sd->exists(SD_PATH_IMPORT_ID)) {
-                File dir = _sd->openDir(SD_PATH_IDENTITY_DIR);
                 int identityFiles = 0;
-                while (dir) {
-                    File entry = dir.openNextFile();
-                    if (!entry) break;
-                    if (!entry.isDirectory()) {
-                        String name = entry.name();
-                        name.toLowerCase();
-                        bool reservedIdentityFile = name == "identity.key" || name.endsWith("/identity.key") ||
-                            name == "identity.identity" || name.endsWith("/identity.identity");
-                        if (!reservedIdentityFile && (name.endsWith(".identity") || name.endsWith(".key"))) {
-                            identityFiles++;
+                {
+                    // Hold the shared SPI bus across the whole dir walk; openDir's
+                    // own guard only covers the initial open, not this iteration.
+                    CoreSync::SpiBusGuard busGuard;
+                    File dir = _sd->openDir(SD_PATH_IDENTITY_DIR);
+                    while (dir) {
+                        File entry = dir.openNextFile();
+                        if (!entry) break;
+                        if (!entry.isDirectory()) {
+                            String name = entry.name();
+                            name.toLowerCase();
+                            bool reservedIdentityFile = name == "identity.key" || name.endsWith("/identity.key") ||
+                                name == "identity.identity" || name.endsWith("/identity.identity");
+                            if (!reservedIdentityFile && (name.endsWith(".identity") || name.endsWith(".key"))) {
+                                identityFiles++;
+                            }
                         }
+                        entry.close();
                     }
-                    entry.close();
+                    dir.close();
                 }
-                dir.close();
                 if (identityFiles == 0) {
                     if (_ui) _ui->lvStatusBar().showToast("Missing identity file", 1200);
                     return;
@@ -1075,6 +1081,7 @@ void LvSettingsScreen::buildItems() {
         announceItem.formatter = [](int) { return String("[Enter]"); };
         announceItem.action = [this]() {
             if (_rns && _cfg) {
+                CoreSync::RnsGuard backendGuard;
                 RNS::Bytes appData = encodeAnnounceName(_cfg->settings().displayName);
                 _rns->announce(appData);
                 if (_ui) { _ui->lvStatusBar().flashAnnounce(); _ui->lvStatusBar().showToast("Announce sent"); }
@@ -2150,6 +2157,7 @@ String LvSettingsScreen::freqFormatWithCursor() const {
 
 void LvSettingsScreen::applyAndSave() {
     if (!_cfg) return;
+    CoreSync::RnsGuard backendGuard;
     auto& s = _cfg->settings();
     // Theme switch applies live: palette globals -> shared styles -> shell.
     // Our own rows re-read Theme:: on the rebuild that follows every commit.

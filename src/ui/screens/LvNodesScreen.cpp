@@ -3,6 +3,7 @@
 #include "ui/LvTheme.h"
 #include "ui/LvInput.h"
 #include "ui/UIManager.h"
+#include "platform/CoreSync.h"
 #include "reticulum/AnnounceManager.h"
 #include "config/UserConfig.h"
 #include <Arduino.h>
@@ -508,6 +509,7 @@ bool LvNodesScreen::handleKey(const KeyEvent& event) {
     // --- Nickname input mode ---
     if (_actionState == NodeAction::NICKNAME_INPUT) {
         if (event.enter || event.character == '\n' || event.character == '\r') {
+            CoreSync::RnsGuard backendGuard;
             if (_actionNodeIdx >= 0 && _actionNodeIdx < (int)_am->nodes().size()) {
                 auto& node = const_cast<DiscoveredNode&>(_am->nodes()[_actionNodeIdx]);
                 String finalName = _nicknameText;
@@ -558,6 +560,7 @@ bool LvNodesScreen::handleKey(const KeyEvent& event) {
                     break;
                 case 1:
                     if (_actionNodeIdx >= 0 && _actionNodeIdx < (int)_am->nodes().size() && _onSelect) {
+                        CoreSync::RnsGuard backendGuard;
                         std::string hex = _am->nodes()[_actionNodeIdx].hash.toHex();
                         hideOverlay();
                         _onSelect(hex);
@@ -578,6 +581,7 @@ bool LvNodesScreen::handleKey(const KeyEvent& event) {
     // --- Confirm delete mode ---
     if (_confirmDelete) {
         if (event.enter || event.character == '\n' || event.character == '\r') {
+            CoreSync::RnsGuard backendGuard;
             if (_actionNodeIdx >= 0 && _actionNodeIdx < (int)_am->nodes().size()) {
                 _am->deleteContact(_actionNodeIdx);
                 if (_ui) _ui->lvStatusBar().showToast("Contact removed", 1200);
@@ -595,6 +599,7 @@ bool LvNodesScreen::handleKey(const KeyEvent& event) {
     if (event.character == 's' || event.character == 'S') {
         int nodeIdx = getFocusedNodeIdx();
         if (nodeIdx >= 0 && nodeIdx < (int)_am->nodes().size()) {
+            CoreSync::RnsGuard backendGuard;
             auto& node = const_cast<DiscoveredNode&>(_am->nodes()[nodeIdx]);
             node.saved = !node.saved;
             if (node.saved) _am->saveContacts();

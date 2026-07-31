@@ -2,6 +2,7 @@
 #include "ui/Theme.h"
 #include "ui/LvTheme.h"
 #include "ui/LvTabBar.h"
+#include "platform/CoreSync.h"
 #include "reticulum/LXMFManager.h"
 #include "reticulum/AnnounceManager.h"
 #include "util/PerfTrace.h"
@@ -79,6 +80,8 @@ void makeTransparent(lv_obj_t* obj) {
 
 std::string LvMessageView::getPeerName() {
     if (_am) {
+        CoreSync::RnsTryGuard backendGuard(0);
+        if (!backendGuard.held()) return _peerHex.substr(0, 12);
         std::string name = _am->lookupName(_peerHex);
         if (!name.empty()) return name;
     }
@@ -91,7 +94,11 @@ void LvMessageView::updateHeader() {
     std::string name = getPeerName();
     lv_label_set_text(_lblHeader, name.c_str());
 
-    const DiscoveredNode* node = _am ? _am->findNodeByHex(_peerHex) : nullptr;
+    const DiscoveredNode* node = nullptr;
+    CoreSync::RnsTryGuard backendGuard(0);
+    if (_am && backendGuard.held()) {
+        node = _am->findNodeByHex(_peerHex);
+    }
     const char* state = "UNKNOWN";
     uint32_t stateColor = Theme::TEXT_MUTED;
 
@@ -112,6 +119,9 @@ void LvMessageView::updateHeader() {
 
 void LvMessageView::markVisibleConversationRead() {
     if (!_markReadPending || !_lxmf) return;
+
+    CoreSync::RnsTryGuard backendGuard(0);
+    if (!backendGuard.held()) return;
 
     unsigned long startMs = PerfTrace::nowMs();
     _lxmf->markRead(_peerHex);
@@ -327,19 +337,22 @@ void LvMessageView::onEnter() {
         // Register status callback - partial update without full rebuild
         std::string peer = _peerHex;
         unsigned long phaseMs = millis();
-        _lxmf->setStatusCallback([this, peer](const std::string& peerHex, double ts, uint32_t savedCounter, LXMFStatus newStatus) {
-            if (peerHex != peer) return;
-            for (int i = (int)_cachedMsgs.size() - 1; i >= 0; i--) {
-                bool sameMessage = savedCounter > 0
-                    ? _cachedMsgs[i].savedCounter == savedCounter
-                    : std::fabs(_cachedMsgs[i].timestamp - ts) < 1.0;
-                if (!_cachedMsgs[i].incoming && sameMessage) {
-                    _cachedMsgs[i].status = newStatus;
-                    updateMessageStatus(i, newStatus);
-                    return;
+        {
+            CoreSync::RnsGuard backendGuard;
+            _lxmf->setStatusCallback([this, peer](const std::string& peerHex, double ts, uint32_t savedCounter, LXMFStatus newStatus) {
+                if (peerHex != peer) return;
+                for (int i = (int)_cachedMsgs.size() - 1; i >= 0; i--) {
+                    bool sameMessage = savedCounter > 0
+                        ? _cachedMsgs[i].savedCounter == savedCounter
+                        : std::fabs(_cachedMsgs[i].timestamp - ts) < 1.0;
+                    if (!_cachedMsgs[i].incoming && sameMessage) {
+                        _cachedMsgs[i].status = newStatus;
+                        updateMessageStatus(i, newStatus);
+                        return;
+                    }
                 }
-            }
-        });
+            });
+        }
         callbackMs = millis() - phaseMs;
     }
     unsigned long phaseMs = millis();
@@ -371,7 +384,10 @@ void LvMessageView::onEnter() {
 }
 
 void LvMessageView::onExit() {
-    if (_lxmf) _lxmf->setStatusCallback(nullptr);
+    if (_lxmf) {
+        CoreSync::RnsGuard backendGuard;
+        _lxmf->setStatusCallback(nullptr);
+    }
     _markReadPending = false;
     hideSendModeMenu();
     _inputText.clear();
@@ -390,6 +406,8 @@ void LvMessageView::refreshUI() {
     updateHeader();
 
     // Only reload from disk when message count changes (new messages arrive)
+    CoreSync::RnsTryGuard backendGuard(0);
+    if (!backendGuard.held()) return;
     auto* summary = _lxmf->getConversationSummary(_peerHex);
     int totalCount = summary ? summary->totalCount : -1;
     if (summary && totalCount == _knownTotalCount) return;
@@ -541,14 +559,21 @@ void LvMessageView::rebuildMessages() {
 
     // Only load from disk if _cachedMsgs is empty (first call or after send)
     if (_cachedMsgs.empty()) {
+        CoreSync::RnsTryGuard backendGuard(0);
+        if (!backendGuard.held()) return;
         unsigned long phaseMs = millis();
         _cachedMsgs = _lxmf->getRecentMessages(_peerHex, CHAT_VIEW_MAX_MESSAGES);
         loadMs = millis() - phaseMs;
         loadedFromStore = true;
     }
     if (_lxmf) {
-        auto* summary = _lxmf->getConversationSummary(_peerHex);
-        _knownTotalCount = summary ? summary->totalCount : (int)_cachedMsgs.size();
+        CoreSync::RnsTryGuard backendGuard(0);
+        if (backendGuard.held()) {
+            auto* summary = _lxmf->getConversationSummary(_peerHex);
+            _knownTotalCount = summary ? summary->totalCount : (int)_cachedMsgs.size();
+        } else if (_knownTotalCount < 0) {
+            _knownTotalCount = (int)_cachedMsgs.size();
+        }
     }
     _lastMsgCount = (int)_cachedMsgs.size();
     _lastRefreshMs = millis();
@@ -701,9 +726,13 @@ void LvMessageView::sendCurrentMessage(bool viaLink) {
     destHash.assignHex(_peerHex.c_str());
     hashMs = millis() - hashMs;
     unsigned long queueStartMs = millis();
-    bool queued = viaLink
-        ? _lxmf->sendMessageViaLink(destHash, _inputText.c_str())
-        : _lxmf->sendMessage(destHash, _inputText.c_str());
+    bool queued;
+    {
+        CoreSync::RnsGuard backendGuard;
+        queued = viaLink
+            ? _lxmf->sendMessageViaLink(destHash, _inputText.c_str())
+            : _lxmf->sendMessage(destHash, _inputText.c_str());
+    }
     unsigned long queueMs = millis() - queueStartMs;
     if (!queued) {
 #if RSDECK_PERF_TRACE

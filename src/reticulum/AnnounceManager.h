@@ -60,7 +60,7 @@ public:
 private:
     void saveContact(const DiscoveredNode& node);
     void removeContact(const std::string& hexHash);
-    void persistKnownDestinationsAfterAnnounce(const char* reason, bool force);
+    bool persistKnownDestinationsAfterAnnounce(const char* reason, bool force);
 
     std::vector<DiscoveredNode> _nodes;
     SDStore* _sd = nullptr;
@@ -69,6 +69,7 @@ private:
     RNS::Bytes _localDestHash;
     bool _contactsDirty = false;
     bool _nameCacheDirty = false;
+    bool _knownDestinationsDirty = false;
     unsigned long _lastContactSave = 0;
     unsigned long _lastAnnounceProcessed = 0;
     std::map<std::string, std::string> _nameCache;  // hexHash → displayName
@@ -78,7 +79,7 @@ private:
     static constexpr int MAX_NODES = 100;
     static constexpr int MAX_NAME_CACHE = 300;
     static constexpr unsigned long CONTACT_SAVE_INTERVAL_MS = 30000;
-    static constexpr unsigned long KNOWN_DESTINATION_PERSIST_MIN_INTERVAL_MS = 5000;
+    static constexpr unsigned long KNOWN_DESTINATION_PERSIST_MIN_INTERVAL_MS = 60000;
     static constexpr unsigned long ANNOUNCE_MIN_INTERVAL_MS = 200;  // Rate-limit announce processing
     unsigned long _lastKnownDestinationsPersist = 0;
 

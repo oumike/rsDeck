@@ -12,6 +12,7 @@
 #include "config/BoardConfig.h"
 #include "config/Config.h"
 #include "platform/RsDeckModeSwitch.h"
+#include "platform/CoreSync.h"
 #include "hal/Display.h"
 #include "hal/TouchInput.h"
 #include "hal/Trackball.h"
@@ -226,6 +227,10 @@ unsigned long lastAutoIfaceLinkCheck = 0;
 // LXMF diagnostic counters (reset each heartbeat)
 static uint32_t diagTcpSkipEvents = 0;
 
+#if RSDECK_UI_CORE_SPLIT
+static void networkTask(void*);
+#endif
+
 // =============================================================================
 // Timezone helper — returns POSIX TZ string for current config
 // =============================================================================
@@ -275,8 +280,12 @@ static bool hasUsableAnnounceTransport() {
 }
 
 static bool announceWithName(bool silent = false) {
+    // Called from both cores (UI manual announce + network auto/boot announce).
+    // Guard the Reticulum access; deliver UI feedback through the snapshot bridge
+    // so we never touch LVGL from the network core.
+    CoreSync::RnsGuard backendGuard;
     if (!hasUsableAnnounceTransport()) {
-        if (!silent) ui.lvStatusBar().showToast("No active transport", 1500);
+        if (!silent) CoreSync::requestToast("No active transport", 1500);
         Serial.println("[ANNOUNCE-TX] skipped: no active transport");
         return false;
     }
@@ -286,8 +295,8 @@ static bool announceWithName(bool silent = false) {
         silent ? "yes" : "no");
     rns.announce(appData);
     if (!silent) {
-        ui.lvStatusBar().flashAnnounce();
-        ui.lvStatusBar().showToast("Announce sent!");
+        CoreSync::netStatus.announceSeq.fetch_add(1);  // UI flashes the TX indicator
+        CoreSync::requestToast("Announce sent!", 0);
     }
     return true;
 }
@@ -1088,6 +1097,10 @@ void setup() {
     const unsigned long setupStartMs = millis();
     bool flashMounted = false;
 
+    // Create cross-core mutexes before any SPI peripheral (display/radio/SD) or
+    // the network task can touch them. No-op in single-threaded builds.
+    CoreSync::begin();
+
     // Step 1: Power pin — CRITICAL: enables all T-Deck Plus peripherals
     Power::enablePeripherals();
 
@@ -1560,6 +1573,12 @@ void setup() {
 
     bootComplete = true;
 
+#if RSDECK_UI_CORE_SPLIT
+    xTaskCreatePinnedToCore(networkTask, "netstack", 16384, nullptr,
+                            1 /* prio, same as loopTask */, nullptr, 0 /* core 0 */);
+    Serial.println("[CORE] Network task started on core 0");
+#endif
+
     // Keep LVGL responsive during blocking radio operations (if screen is on)
     // Re-entrancy guard prevents nested lv_timer_handler() calls
     radio.setYieldCallback([]() {
@@ -1587,6 +1606,7 @@ void setup() {
     lvHomeScreen.setAudioToggleCallback([]() {
         userConfig.settings().audioEnabled = !userConfig.settings().audioEnabled;
         audio.setEnabled(userConfig.settings().audioEnabled);
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         ui.lvStatusBar().showToast(userConfig.settings().audioEnabled ? "Audio ON" : "Audio OFF", 1000);
         Serial.printf("[AUDIO] Notifications %s (save %s)\n",
@@ -1596,6 +1616,7 @@ void setup() {
     lvHomeScreen.setLoraToggleCallback([]() {
         auto& s = userConfig.settings();
         s.loraEnabled = !s.loraEnabled;
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         ui.lvStatusBar().showToast(
             ok ? "LoRa saved; reboot to apply" : "Save failed",
@@ -1626,6 +1647,7 @@ void setup() {
             ep.autoConnect = true;
             s.tcpConnections.push_back(ep);
         }
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         ui.lvStatusBar().showToast(
             ok ? "TCP server saved; reboot to apply" : "Save failed",
@@ -1653,6 +1675,7 @@ void setup() {
             s.wifiRestoreMode = s.wifiMode;
             s.wifiMode = RAT_WIFI_OFF;
         }
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         ui.lvStatusBar().showToast(
             ok ? "WiFi saved; reboot to apply" : "Save failed",
@@ -1665,6 +1688,7 @@ void setup() {
         auto& s = userConfig.settings();
         bool oldTime = s.gpsTimeEnabled;
         s.gpsTimeEnabled = !s.gpsTimeEnabled;
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         if (!ok) {
             s.gpsTimeEnabled = oldTime;
@@ -1742,6 +1766,7 @@ void setup() {
     lvSettingsScreen.setDestinationHash(rns.destinationHashHex());
     lvSettingsScreen.setSaveCallback([]() -> bool {
         inputManager.setTrackballSpeed(userConfig.settings().trackballSpeed);
+        CoreSync::RnsGuard backendGuard;
         bool ok = userConfig.save(sdStore, flash);
         Serial.printf("[CONFIG] Save %s\n", ok ? "OK" : "FAILED");
         return ok;
@@ -1942,84 +1967,8 @@ void setup() {
 // Main Loop
 // =============================================================================
 
-void loop() {
-    handleSerialCommands();
-
-    // 1. Input polling
-    bool screenWasOn = powerMgr.isScreenOn();
-    inputManager.update();
-    bool wakeOnlyInput = !screenWasOn && inputManager.hadStrongActivity();
-    if (inputManager.hadStrongActivity()) {
-        powerMgr.activity();       // Keyboard/touch: wake from any state
-    } else if (inputManager.hadActivity()) {
-        powerMgr.weakActivity();   // Trackball: wake from dim only
-    }
-
-    // 2. Long-press dispatch — screen blanking is the default if no screen consumes it
-    if (inputManager.hadLongPress()) {
-        if (!ui.handleLongPress()) {
-            powerMgr.forceScreenOff();
-        }
-    }
-
-    // 3. Key event dispatch
-    if (inputManager.hasKeyEvent() && !wakeOnlyInput) {
-        const KeyEvent& evt = inputManager.getKeyEvent();
-
-        // Help overlay intercepts all keys when visible
-        if (lvHelpOverlay.isVisible()) {
-            lvHelpOverlay.handleKey(evt);
-        }
-        // QR overlay also dismisses on any keypress while visible
-        else if (lvQrOverlay.isVisible()) {
-            lvQrOverlay.handleKey(evt);
-        }
-        else {
-            // Screen-local input owns the keyboard. This keeps message and
-            // settings text entry from being preempted by global shortcuts.
-            bool consumed = ui.handleKey(evt);
-            if (!consumed) {
-                bool hotkeyAllowed = !ui.isBootMode() || (evt.ctrl && evt.character == 'h');
-                bool hotkeyConsumed = hotkeyAllowed && hotkeys.process(evt);
-                if (!hotkeyConsumed) {
-
-                    // Feed to LVGL input system only if the screen didn't consume it
-                    LvInput::feedKey(evt);
-
-                    // Tab cycling: ,=left /=right OR trackball left/right (only if screen didn't consume)
-                    if (!evt.ctrl && !ui.isBootMode()) {
-                        bool tabLeft  = (evt.character == ',') || evt.left;
-                        bool tabRight = (evt.character == '/') || evt.right;
-                        if (tabLeft) {
-                            ui.lvTabBar().cycleTab(-1);
-                            int tab = ui.lvTabBar().getActiveTab();
-                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
-                        }
-                        if (tabRight) {
-                            ui.lvTabBar().cycleTab(1);
-                            int tab = ui.lvTabBar().getActiveTab();
-                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. LVGL timer handler — 30 FPS active, 5 FPS dimmed.
-    // Bypass the throttle on input activity so a keypress/scroll renders this
-    // iteration instead of waiting up to a full frame interval.
-    {
-        unsigned long now = millis();
-        unsigned long lvglInterval = powerMgr.isDimmed() ? 200 : LVGL_INTERVAL_MS;
-        bool inputBurst = inputManager.hadActivity();
-        if (powerMgr.isScreenOn() && (inputBurst || now - lastLvglTime >= lvglInterval)) {
-            lastLvglTime = now;
-            lv_timer_handler();
-        }
-    }
-
-    // 4. Reticulum loop (radio RX via LoRaInterface) — throttle to ~100Hz
+static void networkLoopStep() {
+    // Reticulum loop (radio RX via LoRaInterface) — throttle to ~100Hz
     unsigned long rnsDuration = 0;
     {
         static unsigned long lastRNS = 0;
@@ -2030,11 +1979,6 @@ void loop() {
             rns.loop();
             rnsDuration = millis() - rnsStart;
         }
-    }
-
-    // 4.5 Keep LVGL responsive after heavy RNS processing (announce floods)
-    if (rnsDuration > LVGL_INTERVAL_MS && powerMgr.isScreenOn()) {
-        lv_timer_handler();
     }
 
     if (bootComplete && bootAnnouncePending && (long)(millis() - bootAnnounceAt) >= 0) {
@@ -2054,12 +1998,14 @@ void loop() {
         }
     }
 
-    // 5. Auto-announce every 30-360 minutes from boot. Manual announces do
+    // Auto-announce every 30-360 minutes from boot. Manual announces do
     // not reset this schedule.
-    const unsigned long announceInterval = (unsigned long)userConfig.settings().announceInterval * 60000; // m -> ms
+    const unsigned long announceInterval =
+        (unsigned long)userConfig.settings().announceInterval * 60000;
     if (bootComplete && millis() - lastAutoAnnounce >= announceInterval) {
         lastAutoAnnounce = millis();
-        if (rns.loraInterface() && rns.loraInterface()->airtimeUtilization() > LoRaInterface::AIRTIME_THROTTLE) {
+        if (rns.loraInterface() &&
+            rns.loraInterface()->airtimeUtilization() > LoRaInterface::AIRTIME_THROTTLE) {
             Serial.println("[AUTO] Skipping announce: LoRa airtime > 25%");
         } else {
             announceWithName(!powerMgr.isScreenOn());
@@ -2067,12 +2013,11 @@ void loop() {
         }
     }
 
-    // 6. LXMF outgoing queue + announce manager deferred saves
+    // LXMF outgoing queue + announce manager deferred saves
     lxmf.loop();
     if (announceManager) announceManager->loop();
-    audio.loop();
 
-    // 7. WiFi STA connection handler
+    // WiFi STA connection handler
     if (wifiSTAStarted) {
         if (wifiNeedsReconnect.load() && WiFi.status() != WL_CONNECTED &&
             (long)(millis() - wifiReconnectAt.load()) >= 0) {
@@ -2088,7 +2033,7 @@ void loop() {
         bool connected = (WiFi.status() == WL_CONNECTED);
         if (connected && !wifiSTAConnected) {
             wifiSTAConnected = true;
-            ui.lvStatusBar().setWiFiActive(true);
+            CoreSync::netStatus.wifiActive.store(true);
             Serial.printf("[WIFI] STA connected: %s\n", WiFi.localIP().toString().c_str());
 
             // NTP time sync (DST-aware POSIX TZ string)
@@ -2100,7 +2045,7 @@ void loop() {
 
             // Recreate TCP clients on every WiFi connect (old clients may have stale sockets)
             reloadTCPClients();
-            // Arm AutoInterface deferred-start; SLAAC needs ~1.5–10s to assign
+            // Arm AutoInterface deferred-start; SLAAC needs ~1.5-10s to assign
             // a link-local IPv6 address, so we don't start the interface here.
             // Trigger link-local creation AFTER association (calling
             // esp_netif_create_ip6_linklocal pre-association is a no-op on
@@ -2112,8 +2057,8 @@ void loop() {
             }
         } else if (!connected && wifiSTAConnected) {
             wifiSTAConnected = false;
-            ui.lvStatusBar().setWiFiActive(false);
-            ui.lvStatusBar().setTCPConnected(false);
+            CoreSync::netStatus.wifiActive.store(false);
+            CoreSync::netStatus.tcpConnected.store(false);
             // Stop and deregister TCP clients cleanly
             for (auto& iface : tcpIfaces) {
                 RNS::Transport::deregister_interface(iface);
@@ -2129,8 +2074,8 @@ void loop() {
         }
     }
 
-    // 7.6. AutoInterface deferred start — fire once SLAAC assigns a link-local
-    // IPv6 address.  Arduino's IPv6Address::toString returns the expanded
+    // AutoInterface deferred start — fire once SLAAC assigns a link-local
+    // IPv6 address. Arduino's IPv6Address::toString returns the expanded
     // form ("0000:0000:..." for unset; "fe80:0000:..." once SLAAC completes),
     // so check the prefix bytes directly: link-local is fe80::/10.
     if (autoIfaceDeferredStart) {
@@ -2149,15 +2094,13 @@ void loop() {
                     scope);
             } else if (elapsed >= 10000) {
                 autoIfaceDeferredStart = false;
-                Serial.println("[AUTOIFACE] SLAAC timeout — no link-local after 10s");
+                Serial.println("[AUTOIFACE] SLAAC timeout - no link-local after 10s");
             }
         }
     }
 
-    // 7.7. AutoInterface link-local rotation watch — covers SLAAC privacy
-    // address rotation while STA stays associated.  notify_link_change()
-    // is idempotent in the library, so polling here is cheap (string
-    // compare, no socket churn) and only does real work on actual change.
+    // AutoInterface link-local rotation watch — covers SLAAC privacy address
+    // rotation while STA stays associated.
     if (autoIface.isOnline() && wifiSTAConnected &&
         millis() - lastAutoIfaceLinkCheck >= 2000) {
         lastAutoIfaceLinkCheck = millis();
@@ -2170,7 +2113,7 @@ void loop() {
         }
     }
 
-    // 7.8. Deferred TCP reload from Settings. Avoid tearing down/recreating
+    // Deferred TCP reload from Settings. Avoid tearing down/recreating
     // Transport interfaces inside the LVGL key event path.
     if (tcpReloadRequested) {
         tcpReloadRequested = false;
@@ -2179,7 +2122,8 @@ void loop() {
         if (announceManager) announceManager->clearTransientNodes();
     }
 
-    // 8. WiFi + TCP loops (with global budget) — skip only if RNS severely overloaded
+    // WiFi + TCP loops (with global budget) — skip only if RNS severely overloaded.
+    bool anyTcpUp = false;
     {
         drainRetiredTCPClients();
         bool skipTcp = (rnsDuration > 500);
@@ -2190,7 +2134,16 @@ void loop() {
             for (auto* tcp : tcpClients) {
                 if (millis() - tcpBudgetStart >= TCP_GLOBAL_BUDGET_MS) break;
                 tcp->loop();
+                if (tcp && tcp->isConnected()) anyTcpUp = true;
                 yield();
+            }
+        }
+        if (skipTcp) {
+            for (auto* tcp : tcpClients) {
+                if (tcp && tcp->isConnected()) {
+                    anyTcpUp = true;
+                    break;
+                }
             }
         }
         // AutoInterface always runs — its loop is non-blocking, capped at 4
@@ -2200,53 +2153,13 @@ void loop() {
         autoIface.loop();
     }
 
-    // 9. BLE loops
+    // BLE loops
 #if HAS_BLE
     bleInterface.loop();
     bleSideband.loop();
 #endif
 
-    // 9.5. GPS poll (non-blocking, reads available UART bytes)
-#if HAS_GPS
-    if (userConfig.settings().gpsTimeEnabled) {
-        gps.loop();
-    }
-#endif
-
-    // 10. Power management
-    powerMgr.loop();
-
-    // 11. Periodic status bar update (1 Hz) + render
-    if (millis() - lastStatusUpdate >= STATUS_UPDATE_MS) {
-        lastStatusUpdate = millis();
-        if (powerMgr.isScreenOn()) {
-            // Update battery related paramt
-            ui.lvStatusBar().setBatteryPercent(powerMgr.batteryPercent());
-            ui.lvStatusBar().setCharging(powerMgr.isCharging());
-            ui.lvStatusBar().setBatteryDisplay(userConfig.settings().batteryDisplay); // Switch between bar and percent
-            // Update TCP connection indicator
-            bool anyTcpUp = false;
-            for (auto* tcp : tcpClients) {
-                if (tcp && tcp->isConnected()) { anyTcpUp = true; break; }
-            }
-            ui.lvStatusBar().setTCPConnected(anyTcpUp);
-            ui.lvStatusBar().setAutoIfacePeers(
-                autoIface.isOnline() ? (int)autoIface.peerCount() : -1);
-#if HAS_GPS
-            if (userConfig.settings().gpsTimeEnabled) {
-                ui.lvStatusBar().setGPSFix(gps.hasTimeFix());
-            }
-#endif
-            // Update clock display (shows time from any valid source: GPS, NTP, etc.)
-            ui.lvStatusBar().setUse24Hour(userConfig.settings().use24HourTime);
-            ui.lvStatusBar().updateTime();
-            ui.update();
-        }
-    }
-
-
-
-    // 12.5. RSSI monitor (non-blocking, one sample per loop iteration)
+    // RSSI monitor (non-blocking, one sample per loop iteration)
     if (rssiMonitorActive && radioOnline) {
         unsigned long now = millis();
         if (now - rssiMonitorStart >= 5000) {
@@ -2263,7 +2176,20 @@ void loop() {
         }
     }
 
-    // 13. Heartbeat for crash diagnosis
+    // Publish network snapshot for the UI core.
+    CoreSync::netStatus.loraOnline.store(radioOnline);
+    CoreSync::netStatus.wifiEnabled.store(userConfig.settings().wifiMode != RAT_WIFI_OFF);
+    CoreSync::netStatus.bleEnabled.store(userConfig.settings().bleEnabled);
+    CoreSync::netStatus.wifiActive.store(wifiSTAConnected || (wifiImpl && wifiImpl->isAPActive()));
+    CoreSync::netStatus.tcpConnected.store(anyTcpUp);
+    CoreSync::netStatus.autoIfacePeers.store(autoIface.isOnline() ? (int)autoIface.peerCount() : -1);
+#if HAS_BLE
+    CoreSync::netStatus.bleActive.store(bleInterface.isClientConnected());
+#else
+    CoreSync::netStatus.bleActive.store(false);
+#endif
+
+    // Heartbeat for crash diagnosis
     {
         unsigned long cycleTime = millis() - loopCycleStart;
         if (cycleTime > maxLoopTime) maxLoopTime = cycleTime;
@@ -2283,7 +2209,6 @@ void loop() {
                           radioOnline ? "ON" : "OFF",
                           sdStore.isReady() ? "OK" : "FAIL",
                           flash.isReady() ? "OK" : "FAIL");
-            // Diagnostic: show registered transport interfaces and TCP connection status
             {
                 auto& ifaces = RNS::Transport::get_interfaces();
                 int tcpUp = 0;
@@ -2316,6 +2241,152 @@ void loop() {
         }
     }
     loopCycleStart = millis();
+}
 
+static void uiLoopStep() {
+    // Render first, outside backend lock.
+    {
+        unsigned long now = millis();
+        unsigned long lvglInterval = powerMgr.isDimmed() ? 200 : LVGL_INTERVAL_MS;
+        if (powerMgr.isScreenOn() && (inputManager.hadActivity() || now - lastLvglTime >= lvglInterval)) {
+            lastLvglTime = now;
+            lv_timer_handler();
+        }
+    }
+
+    // Input polling and power activity flags.
+    bool screenWasOn = powerMgr.isScreenOn();
+    inputManager.update();
+    bool wakeOnlyInput = !screenWasOn && inputManager.hadStrongActivity();
+    if (inputManager.hadStrongActivity()) {
+        powerMgr.activity();
+    } else if (inputManager.hadActivity()) {
+        powerMgr.weakActivity();
+    }
+
+    // Serial command handling can touch backend state; avoid blocking UI input
+    // if the network core is in a long crypto cycle.
+    {
+        CoreSync::RnsTryGuard serialGuard(0);
+        if (serialGuard.held()) {
+            handleSerialCommands();
+        }
+    }
+
+    if (inputManager.hadLongPress()) {
+        if (!ui.handleLongPress()) {
+            powerMgr.forceScreenOff();
+        }
+    }
+
+    if (inputManager.hasKeyEvent() && !wakeOnlyInput) {
+        const KeyEvent& evt = inputManager.getKeyEvent();
+
+        if (lvHelpOverlay.isVisible()) {
+            lvHelpOverlay.handleKey(evt);
+        } else if (lvQrOverlay.isVisible()) {
+            lvQrOverlay.handleKey(evt);
+        } else {
+            bool consumed = ui.handleKey(evt);
+            if (!consumed) {
+                bool hotkeyAllowed = !ui.isBootMode() || (evt.ctrl && evt.character == 'h');
+                bool hotkeyConsumed = false;
+                if (hotkeyAllowed) {
+                    CoreSync::RnsTryGuard hotkeyGuard(0);
+                    hotkeyConsumed = hotkeyGuard.held() && hotkeys.process(evt);
+                }
+                if (!hotkeyConsumed) {
+                    LvInput::feedKey(evt);
+
+                    if (!evt.ctrl && !ui.isBootMode()) {
+                        bool tabLeft = (evt.character == ',') || evt.left;
+                        bool tabRight = (evt.character == '/') || evt.right;
+                        if (tabLeft) {
+                            ui.lvTabBar().cycleTab(-1);
+                            int tab = ui.lvTabBar().getActiveTab();
+                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
+                        }
+                        if (tabRight) {
+                            ui.lvTabBar().cycleTab(1);
+                            int tab = ui.lvTabBar().getActiveTab();
+                            if (lvTabScreens[tab]) ui.setScreen(lvTabScreens[tab]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // UI-core peripherals.
+    audio.loop();
+#if HAS_GPS
+    if (userConfig.settings().gpsTimeEnabled) {
+        gps.loop();
+    }
+#endif
+    powerMgr.loop();
+
+    // Periodic status bar update (1 Hz).
+    if (millis() - lastStatusUpdate >= STATUS_UPDATE_MS) {
+        lastStatusUpdate = millis();
+        if (powerMgr.isScreenOn()) {
+            ui.lvStatusBar().setBatteryPercent(powerMgr.batteryPercent());
+            ui.lvStatusBar().setCharging(powerMgr.isCharging());
+            ui.lvStatusBar().setBatteryDisplay(userConfig.settings().batteryDisplay);
+
+            ui.lvStatusBar().setLoRaOnline(CoreSync::netStatus.loraOnline.load());
+            ui.lvStatusBar().setWiFiActive(CoreSync::netStatus.wifiActive.load());
+            ui.lvStatusBar().setTCPConnected(CoreSync::netStatus.tcpConnected.load());
+            ui.lvStatusBar().setAutoIfacePeers(CoreSync::netStatus.autoIfacePeers.load());
+            ui.lvStatusBar().setBLEActive(CoreSync::netStatus.bleActive.load());
+#if HAS_GPS
+            if (userConfig.settings().gpsTimeEnabled) {
+                ui.lvStatusBar().setGPSFix(gps.hasTimeFix());
+            }
+#endif
+            ui.lvStatusBar().setUse24Hour(userConfig.settings().use24HourTime);
+            ui.lvStatusBar().updateTime();
+
+            CoreSync::RnsTryGuard refreshGuard(3);
+            if (refreshGuard.held()) {
+                ui.update();
+            }
+        }
+    }
+
+    // One-shot events from network core.
+    static uint32_t lastAnnounceSeqSeen = 0;
+    uint32_t announceSeq = CoreSync::netStatus.announceSeq.load();
+    if (announceSeq != lastAnnounceSeqSeen) {
+        lastAnnounceSeqSeen = announceSeq;
+        ui.lvStatusBar().flashAnnounce();
+    }
+
+    char toastMsg[64] = {0};
+    uint32_t toastDuration = CoreSync::takePendingToast(toastMsg, sizeof(toastMsg));
+    if (toastDuration > 0 && toastMsg[0] != '\0') {
+        ui.lvStatusBar().showToast(toastMsg, toastDuration == 1 ? 0 : toastDuration);
+    }
+}
+
+#if RSDECK_UI_CORE_SPLIT
+static void networkTask(void*) {
+    for (;;) {
+        {
+            CoreSync::RnsGuard backendGuard;
+            networkLoopStep();
+        }
+        vTaskDelay(1);
+    }
+}
+#endif
+
+void loop() {
+#if RSDECK_UI_CORE_SPLIT
+    uiLoopStep();
+#else
+    uiLoopStep();
+    networkLoopStep();
+#endif
     yield();
 }

@@ -4,6 +4,7 @@
 #include "ui/LvInput.h"
 #include "ui/UIManager.h"
 #include "ui/LxmFaceAvatar.h"
+#include "platform/CoreSync.h"
 #include "reticulum/LXMFManager.h"
 #include "reticulum/AnnounceManager.h"
 #include "storage/MessageStore.h"
@@ -489,6 +490,7 @@ void LvMessagesScreen::showDeleteConfirm() {
 
 void LvMessagesScreen::addFocusedPeerToContacts() {
     if (!_am || _lpPeerIdx < 0 || _lpPeerIdx >= (int)_sortedPeers.size()) return;
+    CoreSync::RnsGuard backendGuard;
     const auto& peerHex = _sortedPeers[_lpPeerIdx];
     const DiscoveredNode* existing = _am->findNodeByHex(peerHex);
     if (existing && !existing->saved) {
@@ -506,6 +508,7 @@ void LvMessagesScreen::addFocusedPeerToContacts() {
 
 void LvMessagesScreen::deleteFocusedConversation() {
     if (!_lxmf || _lpPeerIdx < 0 || _lpPeerIdx >= (int)_sortedPeers.size()) return;
+    CoreSync::RnsGuard backendGuard;
     const auto& peerHex = _sortedPeers[_lpPeerIdx];
     _lxmf->markRead(peerHex);
     _lxmf->deleteConversation(peerHex);
