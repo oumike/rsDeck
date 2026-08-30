@@ -334,23 +334,15 @@ void LvMessageView::onEnter() {
     unsigned long rebuildMs = 0;
     if (_lxmf) {
         _markReadPending = true;
-        // Register status callback - partial update without full rebuild
+        _statusRefreshPending.store(false);
+        // The callback runs on the network core; defer all cache/LVGL work to
+        // refreshUI() on the UI core.
         std::string peer = _peerHex;
         unsigned long phaseMs = millis();
         {
             CoreSync::RnsGuard backendGuard;
-            _lxmf->setStatusCallback([this, peer](const std::string& peerHex, double ts, uint32_t savedCounter, LXMFStatus newStatus) {
-                if (peerHex != peer) return;
-                for (int i = (int)_cachedMsgs.size() - 1; i >= 0; i--) {
-                    bool sameMessage = savedCounter > 0
-                        ? _cachedMsgs[i].savedCounter == savedCounter
-                        : std::fabs(_cachedMsgs[i].timestamp - ts) < 1.0;
-                    if (!_cachedMsgs[i].incoming && sameMessage) {
-                        _cachedMsgs[i].status = newStatus;
-                        updateMessageStatus(i, newStatus);
-                        return;
-                    }
-                }
+            _lxmf->setStatusCallback([this, peer](const std::string& peerHex, double, uint32_t, LXMFStatus) {
+                if (peerHex == peer) _statusRefreshPending.store(true);
             });
         }
         callbackMs = millis() - phaseMs;
@@ -389,6 +381,7 @@ void LvMessageView::onExit() {
         _lxmf->setStatusCallback(nullptr);
     }
     _markReadPending = false;
+    _statusRefreshPending.store(false);
     hideSendModeMenu();
     _inputText.clear();
     _cachedMsgs.clear();
@@ -408,14 +401,15 @@ void LvMessageView::refreshUI() {
     // Only reload from disk when message count changes (new messages arrive)
     CoreSync::RnsTryGuard backendGuard(0);
     if (!backendGuard.held()) return;
+    bool statusChanged = _statusRefreshPending.exchange(false);
     auto* summary = _lxmf->getConversationSummary(_peerHex);
     int totalCount = summary ? summary->totalCount : -1;
-    if (summary && totalCount == _knownTotalCount) return;
+    if (!statusChanged && summary && totalCount == _knownTotalCount) return;
 
     auto newMsgs = _lxmf->getRecentMessages(_peerHex, CHAT_VIEW_MAX_MESSAGES);
     int newKnownTotal = summary ? totalCount : (int)newMsgs.size();
-    if (newKnownTotal != _knownTotalCount || newMsgs.size() != _cachedMsgs.size()) {
-        bool canAppend = !_cachedMsgs.empty() &&
+    if (statusChanged || newKnownTotal != _knownTotalCount || newMsgs.size() != _cachedMsgs.size()) {
+        bool canAppend = !statusChanged && !_cachedMsgs.empty() &&
             _cachedMsgs.size() < CHAT_VIEW_MAX_MESSAGES &&
             newMsgs.size() > _cachedMsgs.size();
         if (canAppend) {

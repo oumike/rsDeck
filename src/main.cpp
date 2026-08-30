@@ -104,7 +104,7 @@ RNS::Interface wifiIface({RNS::Type::NONE});
 std::vector<TCPClientInterface*> tcpClients;
 std::list<RNS::Interface> tcpIfaces;  // Must persist — Transport stores references (list: no realloc)
 std::list<TCPClientInterface*> retiredTcpClients;
-bool tcpReloadRequested = false;
+std::atomic<bool> tcpReloadRequested{false};
 #if HAS_BLE
 BLEInterface bleInterface;
 BLESideband bleSideband;
@@ -140,6 +140,10 @@ bool radioOnline = false;
 bool bootComplete = false;
 bool bootLoopRecovery = false;
 bool sdHadExistingData = false;
+std::atomic<bool> uiScreenOn{true};
+#if RSDECK_UI_CORE_SPLIT
+bool networkTaskStarted = false;
+#endif
 bool wifiSTAStarted = false;
 WiFiMulti wifiMulti;
 bool wifiSTAConnected = false;
@@ -1099,7 +1103,7 @@ void setup() {
 
     // Create cross-core mutexes before any SPI peripheral (display/radio/SD) or
     // the network task can touch them. No-op in single-threaded builds.
-    CoreSync::begin();
+    bool coreSyncReady = CoreSync::begin();
 
     // Step 1: Power pin — CRITICAL: enables all T-Deck Plus peripherals
     Power::enablePeripherals();
@@ -1112,6 +1116,11 @@ void setup() {
     Serial.printf("  rsDeck v%s\n", RSDECK_VERSION_STRING);
     Serial.println("  LilyGo T-Deck Plus");
     Serial.println("=================================");
+
+    if (!coreSyncReady) {
+        Serial.println("[FATAL] Failed to allocate core synchronization mutexes");
+        while (true) delay(1000);
+    }
 
     esp_reset_reason_t reason = esp_reset_reason();
     const char* reasonStr = "UNKNOWN";
@@ -1361,11 +1370,11 @@ void setup() {
     lxmf.begin(&rns, &messageStore);
     lxmf.setMessageCallback([](const LXMFMessage& msg) {
         Serial.printf("[LXMF] Message from %s\n", msg.sourceHash.toHex().substr(0, 8).c_str());
-        ui.lvTabBar().setUnreadCount(LvTabBar::TAB_MSGS, lxmf.unreadCount());
-        audio.requestMessage();
+        CoreSync::netStatus.unreadMessages.store(lxmf.unreadCount());
+        CoreSync::netStatus.messageSeq.fetch_add(1);
     });
     // Pre-cache unread counts so first tab switch to Messages is instant
-    lxmf.unreadCount();
+    CoreSync::netStatus.unreadMessages.store(lxmf.unreadCount());
     lvBootScreen.setProgress(0.75f, "LXMF ready");
     // (LVGL boot renders via lv_timer_handler in setProgress)
     bootTraceStage("lxmf-begin");
@@ -1573,14 +1582,8 @@ void setup() {
 
     bootComplete = true;
 
-#if RSDECK_UI_CORE_SPLIT
-    xTaskCreatePinnedToCore(networkTask, "netstack", 16384, nullptr,
-                            1 /* prio, same as loopTask */, nullptr, 0 /* core 0 */);
-    Serial.println("[CORE] Network task started on core 0");
-#endif
-
-    // Keep LVGL responsive during blocking radio operations (if screen is on)
-    // Re-entrancy guard prevents nested lv_timer_handler() calls
+#if !RSDECK_UI_CORE_SPLIT
+    // Keep LVGL responsive during blocking radio operations in single-core mode.
     radio.setYieldCallback([]() {
         static bool inYield = false;
         if (inYield) return;
@@ -1590,6 +1593,7 @@ void setup() {
         }
         inYield = false;
     });
+#endif
 
     // Wire up LVGL screen dependencies
     lvHomeScreen.setReticulumManager(&rns);
@@ -1604,51 +1608,67 @@ void setup() {
         Serial.println("[HOME] Announce triggered via Enter");
     });
     lvHomeScreen.setAudioToggleCallback([]() {
-        userConfig.settings().audioEnabled = !userConfig.settings().audioEnabled;
-        audio.setEnabled(userConfig.settings().audioEnabled);
-        CoreSync::RnsGuard backendGuard;
-        bool ok = userConfig.save(sdStore, flash);
-        ui.lvStatusBar().showToast(userConfig.settings().audioEnabled ? "Audio ON" : "Audio OFF", 1000);
+        bool enabled;
+        bool ok;
+        {
+            CoreSync::RnsGuard backendGuard;
+            enabled = !userConfig.settings().audioEnabled;
+            userConfig.settings().audioEnabled = enabled;
+            ok = userConfig.save(sdStore, flash);
+        }
+        audio.setEnabled(enabled);
+        ui.lvStatusBar().showToast(enabled ? "Audio ON" : "Audio OFF", 1000);
         Serial.printf("[AUDIO] Notifications %s (save %s)\n",
-                      userConfig.settings().audioEnabled ? "ON" : "OFF",
+                      enabled ? "ON" : "OFF",
                       ok ? "OK" : "FAILED");
     });
     lvHomeScreen.setLoraToggleCallback([]() {
-        auto& s = userConfig.settings();
-        s.loraEnabled = !s.loraEnabled;
-        CoreSync::RnsGuard backendGuard;
-        bool ok = userConfig.save(sdStore, flash);
+        bool enabled;
+        bool ok;
+        {
+            CoreSync::RnsGuard backendGuard;
+            auto& settings = userConfig.settings();
+            settings.loraEnabled = !settings.loraEnabled;
+            enabled = settings.loraEnabled;
+            ok = userConfig.save(sdStore, flash);
+        }
         ui.lvStatusBar().showToast(
             ok ? "LoRa saved; reboot to apply" : "Save failed",
             ok ? 3000 : 2000);
         Serial.printf("[LORA] Saved %s (save %s, reboot required)\n",
-                      s.loraEnabled ? "ON" : "OFF",
+                      enabled ? "ON" : "OFF",
                       ok ? "OK" : "FAILED");
     });
     lvHomeScreen.setTCPToggleCallback([]() {
-        auto& s = userConfig.settings();
         bool enabled = false;
-        bool hasSavedTcpServer = false;
-        for (const auto& ep : s.tcpConnections) {
-            if (!ep.host.isEmpty()) hasSavedTcpServer = true;
-            if (!ep.host.isEmpty() && ep.autoConnect) { enabled = true; break; }
-        }
-        if (enabled) {
-            for (auto& ep : s.tcpConnections) ep.autoConnect = false;
-        } else if (hasSavedTcpServer) {
-            for (auto& ep : s.tcpConnections) {
-                if (!ep.host.isEmpty()) ep.autoConnect = true;
+        bool ok;
+        {
+            CoreSync::RnsGuard backendGuard;
+            auto& settings = userConfig.settings();
+            bool hasSavedTcpServer = false;
+            for (const auto& endpoint : settings.tcpConnections) {
+                if (!endpoint.host.isEmpty()) hasSavedTcpServer = true;
+                if (!endpoint.host.isEmpty() && endpoint.autoConnect) {
+                    enabled = true;
+                    break;
+                }
             }
-        } else {
-            s.tcpConnections.clear();
-            TCPEndpoint ep;
-            ep.host = "rns.ratspeak.org";
-            ep.port = TCP_DEFAULT_PORT;
-            ep.autoConnect = true;
-            s.tcpConnections.push_back(ep);
+            if (enabled) {
+                for (auto& endpoint : settings.tcpConnections) endpoint.autoConnect = false;
+            } else if (hasSavedTcpServer) {
+                for (auto& endpoint : settings.tcpConnections) {
+                    if (!endpoint.host.isEmpty()) endpoint.autoConnect = true;
+                }
+            } else {
+                settings.tcpConnections.clear();
+                TCPEndpoint endpoint;
+                endpoint.host = "rns.ratspeak.org";
+                endpoint.port = TCP_DEFAULT_PORT;
+                endpoint.autoConnect = true;
+                settings.tcpConnections.push_back(endpoint);
+            }
+            ok = userConfig.save(sdStore, flash);
         }
-        CoreSync::RnsGuard backendGuard;
-        bool ok = userConfig.save(sdStore, flash);
         ui.lvStatusBar().showToast(
             ok ? "TCP server saved; reboot to apply" : "Save failed",
             ok ? 3000 : 2000);
@@ -1657,48 +1677,68 @@ void setup() {
                       ok ? "OK" : "FAILED");
     });
     lvHomeScreen.setWiFiToggleCallback([]() {
-        auto& s = userConfig.settings();
-        if (s.wifiMode == RAT_WIFI_OFF) {
-            RatWiFiMode restoreMode = s.wifiRestoreMode == RAT_WIFI_OFF ? RAT_WIFI_STA : s.wifiRestoreMode;
-            if (restoreMode == RAT_WIFI_STA) {
-                size_t slot = s.wifiSTASelected < s.wifiSTANetworks.size() ? s.wifiSTASelected : 0;
-                if (slot >= s.wifiSTANetworks.size() || s.wifiSTANetworks[slot].ssid.isEmpty()) {
-                    ui.lvStatusBar().showToast("Add WiFi in Settings", 2000);
-                    return;
+        const char* validationError = nullptr;
+        bool ok = false;
+        int wifiMode = RAT_WIFI_OFF;
+        {
+            CoreSync::RnsGuard backendGuard;
+            auto& settings = userConfig.settings();
+            if (settings.wifiMode == RAT_WIFI_OFF) {
+                RatWiFiMode restoreMode = settings.wifiRestoreMode == RAT_WIFI_OFF
+                    ? RAT_WIFI_STA : settings.wifiRestoreMode;
+                if (restoreMode == RAT_WIFI_STA) {
+                    size_t slot = settings.wifiSTASelected < settings.wifiSTANetworks.size()
+                        ? settings.wifiSTASelected : 0;
+                    if (slot >= settings.wifiSTANetworks.size() ||
+                        settings.wifiSTANetworks[slot].ssid.isEmpty()) {
+                        validationError = "Add WiFi in Settings";
+                    }
+                } else if (restoreMode != RAT_WIFI_AP) {
+                    validationError = "Add WiFi in Settings";
                 }
-            } else if (restoreMode != RAT_WIFI_AP) {
-                ui.lvStatusBar().showToast("Add WiFi in Settings", 2000);
-                return;
+                if (!validationError) settings.wifiMode = restoreMode;
+            } else {
+                settings.wifiRestoreMode = settings.wifiMode;
+                settings.wifiMode = RAT_WIFI_OFF;
             }
-            s.wifiMode = restoreMode;
-        } else {
-            s.wifiRestoreMode = s.wifiMode;
-            s.wifiMode = RAT_WIFI_OFF;
+            if (!validationError) {
+                wifiMode = settings.wifiMode;
+                ok = userConfig.save(sdStore, flash);
+            }
         }
-        CoreSync::RnsGuard backendGuard;
-        bool ok = userConfig.save(sdStore, flash);
+        if (validationError) {
+            ui.lvStatusBar().showToast(validationError, 2000);
+            return;
+        }
         ui.lvStatusBar().showToast(
             ok ? "WiFi saved; reboot to apply" : "Save failed",
             ok ? 3000 : 2000);
         Serial.printf("[WIFI] Saved mode %d (save %s, reboot required)\n",
-                      (int)s.wifiMode, ok ? "OK" : "FAILED");
+                      wifiMode, ok ? "OK" : "FAILED");
     });
 #if HAS_GPS
     lvHomeScreen.setGPSToggleCallback([]() {
-        auto& s = userConfig.settings();
-        bool oldTime = s.gpsTimeEnabled;
-        s.gpsTimeEnabled = !s.gpsTimeEnabled;
-        CoreSync::RnsGuard backendGuard;
-        bool ok = userConfig.save(sdStore, flash);
+        bool enabled;
+        bool locationEnabled;
+        bool ok;
+        {
+            CoreSync::RnsGuard backendGuard;
+            auto& settings = userConfig.settings();
+            bool oldTime = settings.gpsTimeEnabled;
+            settings.gpsTimeEnabled = !settings.gpsTimeEnabled;
+            ok = userConfig.save(sdStore, flash);
+            if (!ok) settings.gpsTimeEnabled = oldTime;
+            enabled = settings.gpsTimeEnabled;
+            locationEnabled = settings.gpsLocationEnabled;
+        }
         if (!ok) {
-            s.gpsTimeEnabled = oldTime;
             ui.lvStatusBar().showToast("Save failed", 2000);
             Serial.println("[GPS] Toggle save failed");
             return;
         }
-        if (s.gpsTimeEnabled) {
+        if (enabled) {
             gps.setPosixTZ(currentPosixTZ());
-            gps.setLocationEnabled(s.gpsLocationEnabled);
+            gps.setLocationEnabled(locationEnabled);
             gps.begin();
             ui.lvStatusBar().showToast("GPS ON", 1000);
             Serial.println("[GPS] Enabled via Home");
@@ -1793,10 +1833,14 @@ void setup() {
     auto showQr = []() {
         // Encode `lxma://<destHash>:<publicKey>` so Columba/Sideband
         // scanners get a full identity (no PENDING_IDENTITY round-trip).
-        String destHex = rns.destinationHashHex();
+        String destHex;
         String pubHex;
-        if (auto identity = rns.destination().identity()) {
-            pubHex = String(identity.get_public_key().toHex().c_str());
+        {
+            CoreSync::RnsGuard backendGuard;
+            destHex = rns.destinationHashHex();
+            if (auto identity = rns.destination().identity()) {
+                pubHex = String(identity.get_public_key().toHex().c_str());
+            }
         }
         lvQrOverlay.show(destHex, pubHex);
     };
@@ -1824,16 +1868,22 @@ void setup() {
         if (wipe) {
             Serial.println("[BOOT] User chose to wipe old data");
             lvDataCleanScreen.showStatus("Clearing old data...");
-            sdStore.wipeRsDeck();
-            if (announceManager) announceManager->clearAll();
+            {
+                CoreSync::RnsGuard backendGuard;
+                sdStore.wipeRsDeck();
+                if (announceManager) announceManager->clearAll();
+            }
             Serial.println("[BOOT] Old data cleared");
             lvDataCleanScreen.showStatus("Done! Rebooting...");
             delay(1500);
             ESP.restart();
         } else {
             Serial.println("[BOOT] User chose to keep old data");
-            userConfig.settings().sdStorageEnabled = true;
-            userConfig.save(sdStore, flash);
+            {
+                CoreSync::RnsGuard backendGuard;
+                userConfig.settings().sdStorageEnabled = true;
+                userConfig.save(sdStore, flash);
+            }
             lvDataCleanScreen.showStatus("SD storage enabled. Rebooting...");
             delay(1500);
             ESP.restart();
@@ -1846,9 +1896,12 @@ void setup() {
         ui.setBootMode(false);
         ui.setScreen(&lvHomeScreen);
         ui.lvTabBar().setActiveTab(LvTabBar::TAB_HOME);
-        bootAnnouncePending = true;
-        bootAnnounceAttempts = 0;
-        bootAnnounceAt = millis() + BOOT_ANNOUNCE_DELAY_MS;
+        {
+            CoreSync::RnsGuard backendGuard;
+            bootAnnouncePending = true;
+            bootAnnounceAttempts = 0;
+            bootAnnounceAt = millis() + BOOT_ANNOUNCE_DELAY_MS;
+        }
         Serial.println("[BOOT] Home ready; startup announce scheduled");
     };
 
@@ -1865,9 +1918,17 @@ void setup() {
 
     // Timezone screen done callback
     lvTimezoneScreen.setDoneCallback([goHome](int tzIdx) {
-        userConfig.settings().timezoneIdx = (uint8_t)tzIdx;
-        userConfig.settings().timezoneSet = true;
-        bool saved = userConfig.save(sdStore, flash);
+        bool saved;
+        bool gpsTimeEnabled;
+        uint8_t radioRegion;
+        {
+            CoreSync::RnsGuard backendGuard;
+            userConfig.settings().timezoneIdx = (uint8_t)tzIdx;
+            userConfig.settings().timezoneSet = true;
+            saved = userConfig.save(sdStore, flash);
+            gpsTimeEnabled = userConfig.settings().gpsTimeEnabled;
+            radioRegion = userConfig.settings().radioRegion;
+        }
         if (!saved) {
             Serial.println("[BOOT] Timezone save failed; staying in setup");
             ui.lvStatusBar().showToast("Save failed; storage unavailable", 3000);
@@ -1880,18 +1941,18 @@ void setup() {
         setenv("TZ", tz, 1);
         tzset();
 #if HAS_GPS
-        if (userConfig.settings().gpsTimeEnabled) {
+    if (gpsTimeEnabled) {
             gps.setPosixTZ(tz);
         }
 #endif
         // Warn if timezone suggests a different radio region
         uint8_t tzRegion = TIMEZONE_TABLE[tzIdx].radioRegion;
-        if (tzRegion != userConfig.settings().radioRegion) {
+    if (tzRegion != radioRegion) {
             char msg[64];
             snprintf(msg, sizeof(msg), "TZ suggests %s region", REGION_LABELS[tzRegion]);
             ui.lvStatusBar().showToast(msg, 3000);
             Serial.printf("[REGION] Timezone suggests %s, current is %s\n",
-                REGION_LABELS[tzRegion], REGION_LABELS[userConfig.settings().radioRegion]);
+                REGION_LABELS[tzRegion], REGION_LABELS[radioRegion]);
         }
         goHome();
     });
@@ -1899,21 +1960,24 @@ void setup() {
     // Name input screen (first boot only — when no display name is set)
     lvNameInputScreen.setDoneCallback([showTimezone](const String& name) {
         String finalName = name;
-        if (finalName.isEmpty()) {
-            // Auto-generate: Ratspeak.org-xxx (first 3 chars of LXMF dest hash)
-            String dh = rns.destinationHashHex();
-            finalName = "Ratspeak.org-" + dh.substring(0, 3);
+        bool saved;
+        {
+            CoreSync::RnsGuard backendGuard;
+            if (finalName.isEmpty()) {
+                // Auto-generate: Ratspeak.org-xxx (first 3 chars of LXMF dest hash)
+                String dh = rns.destinationHashHex();
+                finalName = "Ratspeak.org-" + dh.substring(0, 3);
+            }
+            userConfig.settings().displayName = finalName;
+            saved = userConfig.save(sdStore, flash);
+            if (saved && identityMgr.activeIndex() >= 0) {
+                identityMgr.setDisplayName(identityMgr.activeIndex(), finalName);
+            }
         }
-        userConfig.settings().displayName = finalName;
-        bool saved = userConfig.save(sdStore, flash);
         if (!saved) {
             Serial.println("[BOOT] Display name save failed; staying in setup");
             ui.lvStatusBar().showToast("Save failed; storage unavailable", 3000);
             return;
-        }
-        // Also save to active identity slot
-        if (identityMgr.activeIndex() >= 0) {
-            identityMgr.setDisplayName(identityMgr.activeIndex(), finalName);
         }
         Serial.printf("[BOOT] Display name set: '%s'\n", finalName.c_str());
 
@@ -1961,13 +2025,31 @@ void setup() {
                   flash.isReady() ? "OK" : "FAIL",
                   sdStore.isReady() ? "OK" : "FAIL");
     bootTraceStage("setup-complete");
+
+#if RSDECK_UI_CORE_SPLIT
+    networkTaskStarted = xTaskCreatePinnedToCore(
+        networkTask, "netstack", 16384, nullptr,
+        1 /* prio, same as loopTask */, nullptr, 0 /* core 0 */) == pdPASS;
+    if (!networkTaskStarted) {
+        radio.setYieldCallback([]() {
+            static bool inYield = false;
+            if (inYield) return;
+            inYield = true;
+            if (powerMgr.isScreenOn()) lv_timer_handler();
+            inYield = false;
+        });
+    }
+    Serial.println(networkTaskStarted
+        ? "[CORE] Network task started on core 0"
+        : "[CORE] Network task allocation failed; using loopTask fallback");
+#endif
 }
 
 // =============================================================================
 // Main Loop
 // =============================================================================
 
-static void networkLoopStep() {
+static void networkLoopStep(bool serviceLvgl) {
     // Reticulum loop (radio RX via LoRaInterface) — throttle to ~100Hz
     unsigned long rnsDuration = 0;
     {
@@ -1979,6 +2061,10 @@ static void networkLoopStep() {
             rns.loop();
             rnsDuration = millis() - rnsStart;
         }
+    }
+
+    if (serviceLvgl && rnsDuration > LVGL_INTERVAL_MS && powerMgr.isScreenOn()) {
+        lv_timer_handler();
     }
 
     if (bootComplete && bootAnnouncePending && (long)(millis() - bootAnnounceAt) >= 0) {
@@ -2008,7 +2094,7 @@ static void networkLoopStep() {
             rns.loraInterface()->airtimeUtilization() > LoRaInterface::AIRTIME_THROTTLE) {
             Serial.println("[AUTO] Skipping announce: LoRa airtime > 25%");
         } else {
-            announceWithName(!powerMgr.isScreenOn());
+            announceWithName(!uiScreenOn.load());
             Serial.println("[AUTO] Periodic announce");
         }
     }
@@ -2115,8 +2201,7 @@ static void networkLoopStep() {
 
     // Deferred TCP reload from Settings. Avoid tearing down/recreating
     // Transport interfaces inside the LVGL key event path.
-    if (tcpReloadRequested) {
-        tcpReloadRequested = false;
+    if (tcpReloadRequested.exchange(false)) {
         Serial.println("[TCP] Applying deferred settings reload...");
         reloadTCPClients();
         if (announceManager) announceManager->clearTransientNodes();
@@ -2139,6 +2224,14 @@ static void networkLoopStep() {
             }
         }
         if (skipTcp) {
+            for (auto* tcp : tcpClients) {
+                if (tcp && tcp->isConnected()) {
+                    anyTcpUp = true;
+                    break;
+                }
+            }
+        }
+        if (!anyTcpUp) {
             for (auto* tcp : tcpClients) {
                 if (tcp && tcp->isConnected()) {
                     anyTcpUp = true;
@@ -2177,7 +2270,8 @@ static void networkLoopStep() {
     }
 
     // Publish network snapshot for the UI core.
-    CoreSync::netStatus.loraOnline.store(radioOnline);
+    CoreSync::netStatus.loraOnline.store(
+        radioOnline && userConfig.settings().loraEnabled);
     CoreSync::netStatus.wifiEnabled.store(userConfig.settings().wifiMode != RAT_WIFI_OFF);
     CoreSync::netStatus.bleEnabled.store(userConfig.settings().bleEnabled);
     CoreSync::netStatus.wifiActive.store(wifiSTAConnected || (wifiImpl && wifiImpl->isAPActive()));
@@ -2227,16 +2321,6 @@ static void networkLoopStep() {
                     (unsigned long)rns.announceFilterCount());
                 diagTcpSkipEvents = 0;
             }
-#if HAS_GPS
-            if (userConfig.settings().gpsTimeEnabled) {
-                Serial.printf("[GPS] sats=%d timeFix=%s locFix=%s syncs=%lu chars=%lu\n",
-                    gps.satellites(),
-                    gps.hasTimeFix() ? "YES" : "NO",
-                    gps.hasLocationFix() ? "YES" : "NO",
-                    (unsigned long)gps.timeSyncCount(),
-                    (unsigned long)gps.charsProcessed());
-            }
-#endif
             maxLoopTime = 0;
         }
     }
@@ -2322,9 +2406,20 @@ static void uiLoopStep() {
 #if HAS_GPS
     if (userConfig.settings().gpsTimeEnabled) {
         gps.loop();
+        static unsigned long lastGpsDiag = 0;
+        if (millis() - lastGpsDiag >= HEARTBEAT_INTERVAL_MS) {
+            lastGpsDiag = millis();
+            Serial.printf("[GPS] sats=%d timeFix=%s locFix=%s syncs=%lu chars=%lu\n",
+                gps.satellites(),
+                gps.hasTimeFix() ? "YES" : "NO",
+                gps.hasLocationFix() ? "YES" : "NO",
+                (unsigned long)gps.timeSyncCount(),
+                (unsigned long)gps.charsProcessed());
+        }
     }
 #endif
     powerMgr.loop();
+    uiScreenOn.store(powerMgr.isScreenOn());
 
     // Periodic status bar update (1 Hz).
     if (millis() - lastStatusUpdate >= STATUS_UPDATE_MS) {
@@ -2362,6 +2457,18 @@ static void uiLoopStep() {
         ui.lvStatusBar().flashAnnounce();
     }
 
+    static bool messageStatusInitialized = false;
+    static uint32_t lastMessageSeqSeen = 0;
+    uint32_t messageSeq = CoreSync::netStatus.messageSeq.load();
+    if (!messageStatusInitialized || messageSeq != lastMessageSeqSeen) {
+        bool receivedNewMessage = messageSeq != lastMessageSeqSeen;
+        messageStatusInitialized = true;
+        lastMessageSeqSeen = messageSeq;
+        ui.lvTabBar().setUnreadCount(
+            LvTabBar::TAB_MSGS, CoreSync::netStatus.unreadMessages.load());
+        if (receivedNewMessage) audio.requestMessage();
+    }
+
     char toastMsg[64] = {0};
     uint32_t toastDuration = CoreSync::takePendingToast(toastMsg, sizeof(toastMsg));
     if (toastDuration > 0 && toastMsg[0] != '\0') {
@@ -2374,7 +2481,7 @@ static void networkTask(void*) {
     for (;;) {
         {
             CoreSync::RnsGuard backendGuard;
-            networkLoopStep();
+            networkLoopStep(false);
         }
         vTaskDelay(1);
     }
@@ -2384,9 +2491,13 @@ static void networkTask(void*) {
 void loop() {
 #if RSDECK_UI_CORE_SPLIT
     uiLoopStep();
+    if (!networkTaskStarted) {
+        CoreSync::RnsGuard backendGuard;
+        networkLoopStep(true);
+    }
 #else
     uiLoopStep();
-    networkLoopStep();
+    networkLoopStep(true);
 #endif
     yield();
 }

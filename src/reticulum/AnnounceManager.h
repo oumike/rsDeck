@@ -71,6 +71,7 @@ private:
     bool _nameCacheDirty = false;
     bool _knownDestinationsDirty = false;
     unsigned long _lastContactSave = 0;
+    unsigned long _lastNameCacheSave = 0;
     unsigned long _lastAnnounceProcessed = 0;
     std::map<std::string, std::string> _nameCache;  // hexHash → displayName
     unsigned long _globalAnnounceWindowStart = 0;

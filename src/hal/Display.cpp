@@ -73,9 +73,11 @@ void Display::setBrightness(uint8_t level) {
 }
 
 void Display::sleep() {
+    CoreSync::SpiBusGuard busGuard;
     _gfx.sleep();
 }
 
 void Display::wakeup() {
+    CoreSync::SpiBusGuard busGuard;
     _gfx.wakeup();
 }

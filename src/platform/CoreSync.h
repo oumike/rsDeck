@@ -35,7 +35,7 @@
 namespace CoreSync {
 
 // Create the mutexes. Call once, early in setup(), before Display/radio init.
-void begin();
+bool begin();
 
 #if RSDECK_UI_CORE_SPLIT
 
@@ -115,7 +115,9 @@ struct NetStatus {
     std::atomic<bool> tcpConnected{false};
     std::atomic<bool> gpsFix{false};
     std::atomic<int>  autoIfacePeers{-1};   // -1 == AutoInterface offline
+    std::atomic<int>  unreadMessages{0};
     std::atomic<uint32_t> announceSeq{0};   // bump on each announce TX -> UI flashes
+    std::atomic<uint32_t> messageSeq{0};    // bump on each received message
     std::atomic<uint32_t> toastSeq{0};      // bump to raise a deferred toast
 };
 

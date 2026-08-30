@@ -153,7 +153,6 @@ void AnnounceManager::received_announce(
         auto& node = _nodes[it->second];
         if (node.lastSeen != 0 && now >= node.lastSeen &&
             now - node.lastSeen < ANNOUNCE_MIN_INTERVAL_MS) return;
-        bool identityChanged = !idHex.empty() && node.identityHex != idHex;
         // Saved contacts own their local alias. Incoming announce app_data is
         // still cached below, but must not reset the user-chosen contact name.
         if (!name.empty() && !node.saved) node.name = name;
@@ -260,8 +259,9 @@ void AnnounceManager::loop() {
         saveContacts();
         Serial.println("[ANNOUNCE] Deferred contact save complete");
     }
-    if (_nameCacheDirty && now - _lastContactSave >= CONTACT_SAVE_INTERVAL_MS) {
+    if (_nameCacheDirty && now - _lastNameCacheSave >= CONTACT_SAVE_INTERVAL_MS) {
         _nameCacheDirty = false;
+        _lastNameCacheSave = now;
         saveNameCache();
     }
 

@@ -23,26 +23,27 @@ void requestToast(const char* msg, uint32_t durationMs) {
 #endif
     strlcpy(s_toastMsg, msg, sizeof(s_toastMsg));
     s_toastDur = durationMs;
+    netStatus.toastSeq.fetch_add(1);
 #if RSDECK_UI_CORE_SPLIT
     portEXIT_CRITICAL(&s_toastMux);
 #endif
-    netStatus.toastSeq.fetch_add(1);
 }
 
 uint32_t takePendingToast(char* out, uint32_t outSize) {
-    uint32_t seq = netStatus.toastSeq.load();
-    if (seq == s_lastToastSeen) return 0;
-    s_lastToastSeen = seq;
-    uint32_t dur;
+    uint32_t dur = 0;
 #if RSDECK_UI_CORE_SPLIT
     portENTER_CRITICAL(&s_toastMux);
 #endif
-    strlcpy(out, s_toastMsg, outSize);
-    dur = s_toastDur;
+    uint32_t seq = netStatus.toastSeq.load();
+    if (seq != s_lastToastSeen) {
+        s_lastToastSeen = seq;
+        strlcpy(out, s_toastMsg, outSize);
+        dur = s_toastDur == 0 ? 1 : s_toastDur;
+    }
 #if RSDECK_UI_CORE_SPLIT
     portEXIT_CRITICAL(&s_toastMux);
 #endif
-    return dur == 0 ? 1 : dur;  // never return 0 for a real toast
+    return dur;
 }
 
 #if RSDECK_UI_CORE_SPLIT
@@ -50,14 +51,15 @@ uint32_t takePendingToast(char* out, uint32_t outSize) {
 SemaphoreHandle_t spiBusMutex = nullptr;
 SemaphoreHandle_t rnsMutex = nullptr;
 
-void begin() {
+bool begin() {
     if (!spiBusMutex) spiBusMutex = xSemaphoreCreateRecursiveMutex();
     if (!rnsMutex)    rnsMutex = xSemaphoreCreateRecursiveMutex();
+    return spiBusMutex && rnsMutex;
 }
 
 #else
 
-void begin() {}
+bool begin() { return true; }
 
 #endif
 

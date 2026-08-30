@@ -1,6 +1,7 @@
 // Direct port from Ratputer — microReticulum integration
 #include "ReticulumManager.h"
 #include "config/Config.h"
+#include "platform/CoreSync.h"
 #include "util/PerfTrace.h"
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -50,6 +51,7 @@ namespace {
 constexpr size_t RNS_COPY_CHUNK = 512;
 
 bool copySDToFlash(const char* sdPath, const char* flashPath) {
+    CoreSync::SpiBusGuard busGuard;
     File in = SD.open(sdPath, FILE_READ);
     if (!in) return false;
 
@@ -79,6 +81,7 @@ bool copySDToFlash(const char* sdPath, const char* flashPath) {
 
 bool copyFlashToSD(SDStore* sd, const char* flashPath, const char* sdPath) {
     if (!sd || !sd->isReady()) return false;
+    CoreSync::SpiBusGuard busGuard;
     File in = LittleFS.open(flashPath, "r");
     if (!in || in.size() == 0) { if (in) in.close(); return false; }
     unsigned long startMs = PerfTrace::nowMs();
@@ -411,9 +414,9 @@ void ReticulumManager::loop() {
 }
 
 // Synchronous persist — one cycle per call to spread I/O across intervals.
-// Runs on core 1 (main loop) to avoid data races with microReticulum's
-// single-threaded transport state. rsDeck is an endpoint, not a transport
-// node, so path tables are intentionally not persisted across boots.
+// Runs inside the network task's RNS guard so microReticulum's single-threaded
+// transport state cannot be accessed concurrently. rsDeck is an endpoint, not
+// a transport node, so path tables are intentionally not persisted across boots.
 void ReticulumManager::persistData() {
     unsigned long start = millis();
     unsigned long now = millis();
